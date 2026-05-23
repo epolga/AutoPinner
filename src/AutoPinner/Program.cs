@@ -1,4 +1,8 @@
 using System.Globalization;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
 using AutoPinner;
 using AutoPinner.EmailNotifier;
 using AutoPinner.Models;
@@ -6,6 +10,8 @@ using AutoPinner.Utils;
 using CrossStitch.Shared;
 using CrossStitch.Shared.Pinterest;
 using DotNetEnv;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 // Load .env into process env vars BEFORE Config reads them.
 Env.TraversePath().Load();
@@ -65,7 +71,16 @@ Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
 try
 {
-    if (mode == RunMode.Once)
+    if (mode == RunMode.BackfillStripHtml)
+    {
+        var dryRun = args.Any(a => string.Equals(a, "--dry-run", StringComparison.OrdinalIgnoreCase));
+        await RunBackfillStripHtmlAsync(dryRun, cts.Token);
+    }
+    else if (mode == RunMode.ExportDescriptionsCsv)
+    {
+        await RunExportDescriptionsCsvAsync(args, cts.Token);
+    }
+    else if (mode == RunMode.Once)
     {
         await ProcessBatchAsync(cts.Token);
     }
@@ -209,6 +224,234 @@ async Task ProcessOneAsync(Design design, CancellationToken ct)
     Console.WriteLine($"    posted PinID={pinId} (cumulative this run: {stats.Posted})");
 }
 
+// One-off cleanup: for every design that already has a Pinterest pin id,
+// fetch the live pin description, run it through StripHtmlForPlainText,
+// and PATCH the pin if the cleaned text differs from the original. DDB is
+// read-only here; only Pinterest pin descriptions change.
+async Task RunBackfillStripHtmlAsync(bool dryRun, CancellationToken ct)
+{
+    Console.WriteLine($"  backfill mode: strip HTML from existing pin descriptions  dryRun={dryRun}");
+
+    IReadOnlyList<Design> designs;
+    try
+    {
+        designs = await repo.GetAllPinnedAsync(ct);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FATAL: GetAllPinnedAsync failed: {ex.Message}");
+        return;
+    }
+    Console.WriteLine($"  found {designs.Count} pinned design(s)");
+
+    string accessToken;
+    try
+    {
+        accessToken = await oauthClient.GetValidAccessTokenAsync();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FATAL: could not obtain Pinterest access token: {ex.Message}");
+        return;
+    }
+
+    var handler = new HttpClientHandler
+    {
+        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+    };
+    using var http = new HttpClient(handler);
+    http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+    int scanned = 0, unchanged = 0, changed = 0, notFound = 0, errors = 0;
+
+    foreach (var design in designs)
+    {
+        if (ct.IsCancellationRequested) break;
+        if (string.IsNullOrWhiteSpace(design.PinId)) continue;
+        scanned++;
+
+        var pinId = design.PinId!;
+        string currentDescription;
+        try
+        {
+            using var getResp = await http.GetAsync($"https://api.pinterest.com/v5/pins/{pinId}", ct);
+            if (getResp.StatusCode == HttpStatusCode.NotFound)
+            {
+                notFound++;
+                Console.WriteLine($"  [{scanned,3}] PinID={pinId} Design={design.DesignId} — 404 on Pinterest (skipped)");
+                await Task.Delay(TimeSpan.FromMilliseconds(250), ct);
+                continue;
+            }
+            getResp.EnsureSuccessStatusCode();
+            var body = await getResp.Content.ReadAsStringAsync(ct);
+            var json = JObject.Parse(body);
+            currentDescription = json.Value<string>("description") ?? "";
+        }
+        catch (Exception ex)
+        {
+            errors++;
+            Console.WriteLine($"  [{scanned,3}] PinID={pinId} GET failed: {ex.Message}");
+            await Task.Delay(TimeSpan.FromMilliseconds(500), ct);
+            continue;
+        }
+
+        var cleaned = PinterestUploader.StripHtmlForPlainText(currentDescription);
+        if (string.Equals(cleaned, currentDescription, StringComparison.Ordinal))
+        {
+            unchanged++;
+            await Task.Delay(TimeSpan.FromMilliseconds(250), ct);
+            continue;
+        }
+
+        changed++;
+        Console.WriteLine($"  [{scanned,3}] PinID={pinId} Design={design.DesignId} — {currentDescription.Length} → {cleaned.Length} chars");
+        Console.WriteLine($"          before: {PreviewOneLine(currentDescription)}");
+        Console.WriteLine($"          after:  {PreviewOneLine(cleaned)}");
+
+        if (!dryRun)
+        {
+            try
+            {
+                var patchJson = JsonConvert.SerializeObject(new { description = cleaned });
+                using var content = new StringContent(patchJson, Encoding.UTF8, "application/json");
+                using var patchReq = new HttpRequestMessage(HttpMethod.Patch, $"https://api.pinterest.com/v5/pins/{pinId}")
+                {
+                    Content = content,
+                };
+                using var patchResp = await http.SendAsync(patchReq, ct);
+                if (!patchResp.IsSuccessStatusCode)
+                {
+                    var errBody = await patchResp.Content.ReadAsStringAsync(ct);
+                    errors++;
+                    Console.WriteLine($"          PATCH {(int)patchResp.StatusCode}: {Truncate(errBody, 200)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                errors++;
+                Console.WriteLine($"          PATCH error: {ex.Message}");
+            }
+        }
+
+        await Task.Delay(TimeSpan.FromMilliseconds(400), ct);
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("=== Backfill summary ===");
+    Console.WriteLine($"  dry-run:                  {dryRun}");
+    Console.WriteLine($"  pinned designs scanned:   {scanned}");
+    Console.WriteLine($"  no HTML found (skipped):  {unchanged}");
+    Console.WriteLine($"  {(dryRun ? "would update" : "patched")}:                  {changed}");
+    Console.WriteLine($"  not-found on Pinterest:   {notFound}");
+    Console.WriteLine($"  errors:                   {errors}");
+}
+
+// One-off export: write a CSV with DesignID, AlbumID, PinID, pin URL on
+// pinterest.com, and the description we *would* PATCH if we had pin_edit
+// permission. Used as a manual-edit worklist. DDB is read-only; no
+// Pinterest calls.
+async Task RunExportDescriptionsCsvAsync(string[] argv, CancellationToken ct)
+{
+    var outputPath = ResolveOutputPath(argv, defaultName: "pin-descriptions.csv");
+    Console.WriteLine($"  export mode: writing CSV  output={outputPath}");
+
+    IReadOnlyList<Design> designs;
+    try
+    {
+        designs = await repo.GetAllPinnedAsync(ct);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"FATAL: GetAllPinnedAsync failed: {ex.Message}");
+        return;
+    }
+    Console.WriteLine($"  found {designs.Count} pinned design(s)");
+
+    var rows = 0;
+    using (var writer = new StreamWriter(outputPath, append: false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)))
+    {
+        await writer.WriteLineAsync("DesignID,AlbumID,PinID,PinURL,Description");
+
+        foreach (var design in designs.OrderBy(d => d.AlbumId).ThenBy(d => d.DesignId))
+        {
+            if (ct.IsCancellationRequested) break;
+            if (string.IsNullOrWhiteSpace(design.PinId)) continue;
+
+            var pinInput = new PinPatternInfo
+            {
+                AlbumId = design.AlbumId,
+                DesignId = design.DesignId,
+                NPage = design.NPage,
+                Title = design.Caption,
+                Description = design.Description,
+                Notes = design.Notes,
+                Width = design.Width,
+                Height = design.Height,
+                NColors = design.NColors,
+            };
+
+            string description;
+            try
+            {
+                description = uploader.ComposeDescriptionFor(pinInput);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"  Design {design.DesignId}: compose failed — {ex.Message}");
+                continue;
+            }
+
+            var pinUrl = $"https://www.pinterest.com/pin/{design.PinId}/";
+
+            await writer.WriteLineAsync(string.Join(",", new[]
+            {
+                design.DesignId.ToString(CultureInfo.InvariantCulture),
+                design.AlbumId.ToString(CultureInfo.InvariantCulture),
+                CsvField(design.PinId!),
+                CsvField(pinUrl),
+                CsvField(description),
+            }));
+            rows++;
+        }
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("=== Export summary ===");
+    Console.WriteLine($"  rows written: {rows}");
+    Console.WriteLine($"  output:       {outputPath}");
+}
+
+static string ResolveOutputPath(string[] argv, string defaultName)
+{
+    for (var i = 0; i < argv.Length - 1; i++)
+    {
+        if (string.Equals(argv[i], "--output", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(argv[i], "-o", StringComparison.OrdinalIgnoreCase))
+        {
+            return argv[i + 1];
+        }
+    }
+    return Path.Combine(Directory.GetCurrentDirectory(), defaultName);
+}
+
+// RFC 4180 CSV field escape: wrap in double-quotes, double any internal
+// double-quote. We also coerce embedded CR/LF to spaces so each pin
+// occupies exactly one CSV row (Pinterest descriptions can carry newlines
+// for the hashtag block).
+static string CsvField(string s)
+{
+    if (string.IsNullOrEmpty(s)) return "";
+    var oneLine = s.Replace("\r\n", " ").Replace("\n", " ").Replace("\r", " ");
+    return "\"" + oneLine.Replace("\"", "\"\"") + "\"";
+}
+
+static string PreviewOneLine(string s)
+{
+    var oneLine = s.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ");
+    while (oneLine.Contains("  ")) oneLine = oneLine.Replace("  ", " ");
+    return Truncate(oneLine.Trim(), 160);
+}
+
 async Task MaybeAlertConsecutiveAsync(Design design)
 {
     if (consecutiveFailures < config.AlertConsecutiveFailureThreshold) return;
@@ -291,6 +534,8 @@ static RunMode ParseMode(string[] argv)
     {
         if (string.Equals(a, "--once", StringComparison.OrdinalIgnoreCase)) return RunMode.Once;
         if (string.Equals(a, "--daemon", StringComparison.OrdinalIgnoreCase)) return RunMode.Daemon;
+        if (string.Equals(a, "--backfill-strip-html", StringComparison.OrdinalIgnoreCase)) return RunMode.BackfillStripHtml;
+        if (string.Equals(a, "--export-descriptions-csv", StringComparison.OrdinalIgnoreCase)) return RunMode.ExportDescriptionsCsv;
     }
     Console.WriteLine("  no run mode arg; defaulting to --once. Pass --daemon for the loop.");
     return RunMode.Once;
@@ -298,7 +543,7 @@ static RunMode ParseMode(string[] argv)
 
 static string Truncate(string s, int max) => s.Length > max ? s[..max] : s;
 
-internal enum RunMode { Once, Daemon }
+internal enum RunMode { Once, Daemon, BackfillStripHtml, ExportDescriptionsCsv }
 
 internal sealed class RunStats
 {

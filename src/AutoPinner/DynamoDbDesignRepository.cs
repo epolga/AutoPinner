@@ -105,6 +105,52 @@ public sealed class DynamoDbDesignRepository : IDisposable
     }
 
     /// <summary>
+    /// Enumerate every DESIGN row that already has a Pinterest pin id under
+    /// any of the six historical attribute names. Used by the one-off
+    /// backfill commands (e.g. --backfill-strip-html); paginates through
+    /// the GSI until exhausted.
+    /// </summary>
+    public async Task<IReadOnlyList<Design>> GetAllPinnedAsync(CancellationToken ct = default)
+    {
+        var result = new List<Design>();
+        Dictionary<string, AttributeValue>? exclusiveStartKey = null;
+
+        do
+        {
+            var req = new QueryRequest
+            {
+                TableName = _tableName,
+                IndexName = GsiName,
+                KeyConditionExpression = "#et = :design",
+                ExpressionAttributeNames = new Dictionary<string, string>
+                {
+                    ["#et"] = "EntityType",
+                },
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                {
+                    [":design"] = new AttributeValue { S = "DESIGN" },
+                },
+                ScanIndexForward = false,
+                ExclusiveStartKey = exclusiveStartKey,
+            };
+
+            var resp = await _client.QueryAsync(req, ct).ConfigureAwait(false);
+
+            foreach (var item in resp.Items)
+            {
+                if (!HasAnyPinId(item)) continue;
+                var d = ProjectDesign(item);
+                if (d is not null) result.Add(d);
+            }
+
+            exclusiveStartKey = (resp.LastEvaluatedKey is { Count: > 0 }) ? resp.LastEvaluatedKey : null;
+        }
+        while (exclusiveStartKey is not null);
+
+        return result;
+    }
+
+    /// <summary>
     /// Attempt to mark a design as POSTING. Returns false if the design has
     /// already been claimed by another run, was completed, or somehow grew a
     /// pin id since we read it. The caller treats false as a non-error skip.
