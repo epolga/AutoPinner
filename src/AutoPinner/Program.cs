@@ -3,10 +3,11 @@ using AutoPinner;
 using AutoPinner.EmailNotifier;
 using AutoPinner.Models;
 using AutoPinner.Utils;
+using CrossStitch.Shared;
+using CrossStitch.Shared.Pinterest;
 using DotNetEnv;
 
-// Load .env into process env vars BEFORE Config reads them. No-op if the file
-// is absent (e.g. when env vars are injected by a process supervisor in prod).
+// Load .env into process env vars BEFORE Config reads them.
 Env.TraversePath().Load();
 
 var mode = ParseMode(args);
@@ -22,22 +23,40 @@ try
 catch (Exception ex)
 {
     Console.Error.WriteLine($"FATAL: config invalid — {ex.Message}");
-    // Best-effort one-shot config-failure alert. If email isn't configured
-    // either, this falls through to a no-op log.
     await TrySendConfigFailureAsync(ex, runId);
     return 2;
 }
 
 Console.WriteLine($"  {config}");
 
+// Shared lib bootstrap. All wiring lives here so Program.cs documents the
+// dependencies and the shared library never reads env / config itself.
+var oauthClient = new PinterestOAuthClient(new PinterestOAuthConfig
+{
+    ClientId = config.PinterestClientId,
+    ClientSecret = config.PinterestClientSecret,
+    RedirectUri = config.PinterestRedirectUri,
+    TokenStorePath = PlatformConfig.ResolvePinterestTokenPath(),
+});
+
+var linkHelper = new PatternLinkHelper(new PatternLinkConfig
+{
+    SiteBaseUrl = config.BaseUrl,
+    ImageBaseUrl = config.ImageBaseUrl,
+    PhotoPrefix = config.PhotoPrefix,
+    AlbumUrlTemplate = config.AlbumUrlTemplate,
+});
+
+var uploader = new PinterestUploader(
+    new PinterestUploaderConfig { DefaultBoardId = config.DefaultBoardId },
+    linkHelper,
+    oauthClient);
+
 var notifier = BuildNotifier(config);
 using var dedup = new AlertDeduplicator(config.AwsRegion, config.DdbTableName, TimeSpan.FromMinutes(config.AlertCooldownMinutes));
 using var repo = new DynamoDbDesignRepository(config.AwsRegion, config.DdbTableName);
-var boards = await BoardResolver.LoadAsync(config.BoardsCsvPath, config.DefaultBoardId);
-Console.WriteLine($"  loaded {boards.MappedCount} album→board mappings from {config.BoardsCsvPath}");
-var composer = new PinComposer(config.BaseUrl, boards);
-using var pinterest = new PinterestClient(config.PinterestAccessToken);
 var rateLimiter = new RateLimiter(TimeSpan.FromSeconds(config.PostIntervalSeconds));
+var retryPolicy = new RetryPolicy();
 
 var stats = new RunStats();
 var consecutiveFailures = 0;
@@ -127,25 +146,28 @@ async Task ProcessOneAsync(Design design, CancellationToken ct)
         return;
     }
 
-    PinterestCreatePinRequest payload;
-    try
+    var pinInput = new PinPatternInfo
     {
-        payload = composer.Compose(design);
-    }
-    catch (Exception ex)
-    {
-        stats.Failed++;
-        consecutiveFailures++;
-        await repo.MarkFailedAsync(design, $"Compose: {ex.Message}", ct);
-        await AlertAsync("Compose", "Config", ex.GetType().Name, ex.Message, design, attempts: design.PinterestAttemptCount + 1);
-        await MaybeAlertConsecutiveAsync(design);
-        return;
-    }
+        AlbumId = design.AlbumId,
+        DesignId = design.DesignId,
+        NPage = design.NPage,
+        Title = design.Caption,
+        Description = design.Description,
+        Notes = design.Notes,
+        Width = design.Width,
+        Height = design.Height,
+        NColors = design.NColors,
+    };
 
     string pinId;
     try
     {
-        pinId = await pinterest.CreatePinAsync(payload, ct);
+        // Retry transient Pinterest failures (429 + 5xx) with exponential
+        // backoff; non-transient 4xx falls through immediately.
+        pinId = await retryPolicy.ExecuteAsync(
+            _ => uploader.UploadPinForPatternAsync(pinInput),
+            ex => ex is PinterestApiException papi && papi.IsTransient,
+            ct);
     }
     catch (PinterestApiException papi)
     {
@@ -160,7 +182,7 @@ async Task ProcessOneAsync(Design design, CancellationToken ct)
     {
         stats.Failed++;
         consecutiveFailures++;
-        await repo.MarkFailedAsync(design, $"CreatePin: {ex.Message}", ct);
+        await repo.MarkFailedAsync(design, $"UploadPin: {ex.Message}", ct);
         await AlertAsync("CreatePin", "Unexpected", ex.GetType().Name, ex.Message, design, attempts: design.PinterestAttemptCount + 1);
         await MaybeAlertConsecutiveAsync(design);
         return;
@@ -172,9 +194,8 @@ async Task ProcessOneAsync(Design design, CancellationToken ct)
     }
     catch (Exception ex)
     {
-        // Pin DID land on Pinterest but we couldn't write the id back. This
-        // is the spec's "orphan pin" case — alert immediately and don't keep
-        // posting until it's investigated.
+        // Pin DID land on Pinterest but we couldn't write the id back —
+        // orphan pin case. Alert immediately and stop the run.
         stats.Failed++;
         consecutiveFailures++;
         await AlertAsync("UpdateDDBPosted", "UpdateDDB", ex.GetType().Name,
@@ -226,9 +247,8 @@ async Task TrySendConfigFailureAsync(Exception ex, string id)
 {
     try
     {
-        // We can't use Config to build the notifier — it failed. Read raw env.
-        var to = Environment.GetEnvironmentVariable("ALERT_EMAIL_TO");
-        var from = Environment.GetEnvironmentVariable("ALERT_EMAIL_FROM");
+        var to = Environment.GetEnvironmentVariable("AdminEmail") ?? Environment.GetEnvironmentVariable("ADMIN_EMAIL");
+        var from = Environment.GetEnvironmentVariable("SenderEmail") ?? Environment.GetEnvironmentVariable("SENDER_EMAIL");
         var region = Environment.GetEnvironmentVariable("AWS_REGION") ?? "us-east-1";
         if (string.IsNullOrWhiteSpace(to) || string.IsNullOrWhiteSpace(from)) return;
         using var n = new SesEmailNotifier(region, from!, to!);
@@ -258,21 +278,11 @@ IEmailNotifier BuildNotifier(Config cfg)
 {
     if (!cfg.EmailEnabled)
     {
-        Console.WriteLine("  email: disabled (ALERT_EMAIL_TO / ALERT_EMAIL_FROM not set)");
+        Console.WriteLine("  email: disabled (SenderEmail / AdminEmail not set)");
         return new NoopEmailNotifier();
     }
-    if (cfg.EmailTransport == "smtp")
-    {
-        if (string.IsNullOrWhiteSpace(cfg.SmtpHost) || string.IsNullOrWhiteSpace(cfg.SmtpUser) || string.IsNullOrWhiteSpace(cfg.SmtpPass))
-        {
-            Console.Error.WriteLine("  email: smtp transport selected but SES_SMTP_HOST/USER/PASS missing — falling back to noop");
-            return new NoopEmailNotifier();
-        }
-        Console.WriteLine($"  email: smtp via {cfg.SmtpHost}:{cfg.SmtpPort}");
-        return new SmtpEmailNotifier(cfg.SmtpHost!, cfg.SmtpPort, cfg.SmtpUser!, cfg.SmtpPass!, cfg.AlertEmailFrom!, cfg.AlertEmailTo!);
-    }
-    Console.WriteLine($"  email: SES ({cfg.AlertEmailFrom} → {cfg.AlertEmailTo})");
-    return new SesEmailNotifier(cfg.AwsRegion, cfg.AlertEmailFrom!, cfg.AlertEmailTo!, cfg.SesConfigurationSet);
+    Console.WriteLine($"  email: SES ({cfg.SenderEmail} → {cfg.AdminEmail})");
+    return new SesEmailNotifier(cfg.AwsRegion, cfg.SenderEmail!, cfg.AdminEmail!, cfg.SesConfigurationSetName);
 }
 
 static RunMode ParseMode(string[] argv)

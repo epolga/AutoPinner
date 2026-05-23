@@ -2,7 +2,7 @@
 
 C# .NET 8 worker that pulls cross-stitch designs from DynamoDB (newest first), creates Pinterest pins for the ones that don't have a pin yet, and writes the returned pin id back into the same row. Runs as a one-shot (`--once`) or a long-running daemon (`--daemon`).
 
-Sister project of [`Uploader`](../Uploader) (which writes new designs into DynamoDB after upload) and [`cross-stitch/automation/pinterest-agent`](../cross-stitch/automation/pinterest-agent) (the daily analytics/reporting agent). Lives in the same workspace.
+Sister project of [`Uploader`](../Uploader) (which writes new designs into DynamoDB after upload) and [`cross-stitch/automation/pinterest-agent`](../cross-stitch/automation/pinterest-agent) (the daily analytics/reporting agent). The Pinterest upload + OAuth + SES code itself lives in the shared [`CrossStitch.Shared`](../CrossStitch.Shared) library; both Uploader and AutoPinner reference it so a change to "how we post pins" only happens in one place.
 
 Task spec: [`cross-stitch-platform-docs/docs/tasks/TASK_AutoPinner.md`](../cross-stitch-platform-docs/docs/tasks/TASK_AutoPinner.md).
 
@@ -31,20 +31,19 @@ Daemon mode loops on `POST_INTERVAL_SECONDS` between batches and respects `DAILY
 
 ## Board selection
 
-Reads `AlbumBoards.csv` (`AlbumID,AlbumCaption,BoardID` — 4-digit zero-padded AlbumID), matching the format produced by [`Uploader/Helpers/PinterestBoardCreator.cs`](../Uploader/Uploader/Helpers/PinterestBoardCreator.cs) and consumed by [`Uploader/Helpers/PinterestHelper.cs`](../Uploader/Uploader/Helpers/PinterestHelper.cs). The CSV is mirrored into this repo at [`src/AutoPinner/AlbumBoards.csv`](src/AutoPinner/AlbumBoards.csv); sync it manually if Uploader's diverges.
+The shared `PinterestUploader` reads the canonical `AlbumBoards.csv` at [`cross-stitch-platform-docs/data/AlbumBoards.csv`](../cross-stitch-platform-docs/data/AlbumBoards.csv) — same file Uploader uses. Path is resolved via `CrossStitch.Shared.PlatformConfig.ResolveAlbumBoardsCsvPath()`, which reads `cross-stitch-platform-docs/platform-config.json`'s `albumBoardsCsvPath` key.
 
 If an album isn't in the CSV, falls back to `DEFAULT_BOARD_ID`; if that's also unset, throws (no board → no pin).
 
 ## Email alerts
 
-When a non-transient API error, persistent DDB failure, or `N` consecutive failures occurs, AutoPinner emails the operator. Defaults:
+When a non-transient API error, persistent DDB failure, or `N` consecutive failures occurs, AutoPinner emails the operator via the shared `CrossStitch.Shared.Email.EmailHelper` (the same path Uploader uses). Defaults:
 
-- Transport: AWS SES (`AUTO_PINNER_EMAIL_TRANSPORT=ses`). SMTP fallback (`=smtp`) supported via `SES_SMTP_*` vars.
+- Transport: AWS SES via the AWS SDK.
+- Config: reuses Uploader's App.config key names verbatim — `SenderEmail`, `AdminEmail`, `SesConfigurationSetName` — so both apps resolve to the same verified identity (`ann@cross-stitch.com` in the cross-stitch workspace today).
 - Dedup: an SHA-256 fingerprint of `operation|status|errorClass` is stored at DDB `ID=SYS#ALERTS, NPage=AUTOPINNER` along with `LastAlertAtUtc`. Same-fingerprint alerts within `ALERT_COOLDOWN_MINUTES` (default 60) are suppressed.
 - Threshold: `ALERT_CONSECUTIVE_FAILURE_THRESHOLD` (default 5) triggers a separate "still failing" alert.
-- If both `ALERT_EMAIL_TO` and `ALERT_EMAIL_FROM` are empty, the notifier is a no-op (failures are still logged to stderr).
-
-The sender identity must be verified in SES. The cross-stitch workspace already has `ann@cross-stitch.com` verified (used by Uploader and the pinterest-agent); reuse it by setting `ALERT_EMAIL_FROM=ann@cross-stitch.com`.
+- If both `SenderEmail` and `AdminEmail` are empty, the notifier is a no-op (failures are still logged to stderr).
 
 ## Configuration
 
@@ -55,22 +54,22 @@ All settings come from environment variables. AutoPinner auto-loads a `.env` fil
 | `AWS_REGION` | `us-east-1` | DDB + SES region |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (or `AWS_PROFILE`) | — | AWS credentials. The pinterest-agent IAM user has the required `dynamodb:Query/UpdateItem/PutItem/GetItem` on `CrossStitchItems` and `ses:SendEmail` on the cross-stitch.com identity. |
 | `DDB_TABLE_NAME` | `CrossStitchItems` | Table name |
-| `PINTEREST_ACCESS_TOKEN` | required | Pinterest v5 OAuth bearer token |
+| `PinterestClientId` / `PinterestClientSecret` / `PinterestRedirectUri` | required (id + secret) | Pinterest OAuth app credentials. Same key names as Uploader's `App.private.config`. The on-disk token JSON is shared with Uploader via `platform-config.json`. |
 | `POST_INTERVAL_SECONDS` | `300` | Min gap between pins in daemon mode |
 | `DAILY_CAP` | `200` | Max pins per process lifetime |
 | `MAX_BATCH_PER_RUN` | `1` | Batch size per `--once` invocation |
 | `BASE_URL` | `https://cross-stitch.com` | Used to build pin destination links |
+| `IMAGE_BASE_URL` | `https://d2o1uvvg91z7o4.cloudfront.net` | CDN/S3 base for design photos |
+| `PHOTO_PREFIX` | `photos` | Path segment under `IMAGE_BASE_URL` |
+| `ALBUM_URL_TEMPLATE` | — | Optional override; placeholders `{AlbumId}` `{CaptionSlug}` |
 | `ENVIRONMENT_NAME` | `dev` | Appears in email subjects |
-| `BOARDS_CSV_PATH` | `AlbumBoards.csv` | AlbumID → BoardID mapping |
-| `DEFAULT_BOARD_ID` | — | Fallback board if album not in CSV |
-| `ALERT_EMAIL_TO` / `ALERT_EMAIL_FROM` | — | Operator recipient + verified SES sender. Both empty disables email. |
+| `DEFAULT_BOARD_ID` | — | Fallback board if album not in `cross-stitch-platform-docs/data/AlbumBoards.csv` |
+| `SenderEmail` / `AdminEmail` | — | Sender (verified SES identity) + recipient. Both empty disables email. Same key names as Uploader's App.config. |
+| `SesConfigurationSetName` | — | Optional SES configuration set (matches Uploader's key name) |
 | `ALERT_COOLDOWN_MINUTES` | `60` | Dedup window for same-fingerprint alerts |
 | `ALERT_CONSECUTIVE_FAILURE_THRESHOLD` | `5` | Trigger a "still failing" alert at this run-streak |
 | `ALERT_DAILY_SUMMARY_ENABLED` | `false` | (Planned) daily roll-up email |
 | `ALERT_DAILY_SUMMARY_HOUR_UTC` | `7` | (Planned) hour at which the daily summary fires |
-| `SES_CONFIGURATION_SET` | — | Optional SES configuration set |
-| `AUTO_PINNER_EMAIL_TRANSPORT` | `ses` | `ses` or `smtp` |
-| `SES_SMTP_HOST` / `SES_SMTP_PORT` / `SES_SMTP_USER` / `SES_SMTP_PASS` | — | Required only if transport=smtp |
 
 ## Running locally
 
@@ -129,38 +128,33 @@ dotnet run -- --daemon
 
 1. `dotnet run -- --once` — should print fetch → claim → compose → POST → mark posted, then summary.
 2. Re-run immediately — same DesignID should NOT be re-pinned (filtered by the existing pin id check).
-3. Temporarily invalidate `PINTEREST_ACCESS_TOKEN` — failure should be marked `FAILED` on the row, and an alert email should arrive (if configured); a second run inside `ALERT_COOLDOWN_MINUTES` with the same failure should NOT send another email.
+3. Temporarily invalidate `PinterestClientSecret` (or move the Pinterest token JSON aside) — failure should be marked `FAILED` on the row, and an alert email should arrive (if configured); a second run inside `ALERT_COOLDOWN_MINUTES` with the same failure should NOT send another email.
 
 ## Code layout
 
 ```
 src/AutoPinner/
-├── AlbumBoards.csv                       (mirrored from Uploader; sync manually)
-├── AutoPinner.csproj
-├── BoardResolver.cs                      AlbumID → BoardID lookup
-├── Config.cs                             env-var loader
+├── AutoPinner.csproj                     net8.0; ProjectReference → CrossStitch.Shared
+├── Config.cs                             env-var loader (Uploader-aligned naming)
 ├── DynamoDbDesignRepository.cs           query / claim / mark posted / mark failed
-├── PinComposer.cs                        title / description / link / image URL builder
-├── PinterestClient.cs                    v5 create-pin with backoff
-├── Program.cs                            args, lifecycle, batch loop, alerts
+├── Program.cs                            args, lifecycle, batch loop, alerts, retry wrapper
 ├── EmailNotifier/
 │   ├── AlertDeduplicator.cs              fingerprint + cooldown in DDB
 │   ├── IEmailNotifier.cs
 │   ├── NoopEmailNotifier.cs              logging-only fallback
-│   ├── SesEmailNotifier.cs               AWS SDK SES API
-│   └── SmtpEmailNotifier.cs              SES SMTP relay or any other SMTP
+│   └── SesEmailNotifier.cs               thin wrapper around shared EmailHelper
 ├── Models/
-│   ├── Design.cs                         materialised DDB row
-│   ├── PinterestCreatePinRequest.cs
-│   └── PinterestCreatePinResponse.cs
+│   └── Design.cs                         materialised DDB row
 └── Utils/
     ├── RateLimiter.cs                    daemon-mode min-interval gate
-    └── RetryPolicy.cs                    exponential backoff with jitter
+    └── RetryPolicy.cs                    exponential backoff with jitter (wraps shared uploader)
 ```
+
+The Pinterest upload / OAuth / SES code itself lives in the shared library — see [`CrossStitch.Shared`](../CrossStitch.Shared/README.md).
 
 ## Notes
 
 - **Pin-id attribute drift.** AutoPinner writes the canonical `PinID` attribute (matching Uploader's writer) and reads from all six historical names. See [`dynamodb-schema.md §4.4`](../cross-stitch-platform-docs/docs/integration/dynamodb-schema.md) for the full drift list.
-- **Image URL convention.** Pulls from `https://d2o1uvvg91z7o4.cloudfront.net/photos/{AlbumID}/{DesignID}/4.jpg` (the same default the cross-stitch reader synthesizes for designs without an explicit `ImageUrl` attribute).
-- **Design page URL convention.** Builds `{BASE_URL}/{Caption-with-spaces-as-dashes}-{AlbumID}-{NPage-1}-Free-Design.aspx?utm_source=Pinterest&utm_medium=Organic&utm_campaign=AutoPins` per [`url-conventions.md §4.1`](../cross-stitch-platform-docs/docs/integration/url-conventions.md).
-- **Token refresh.** v1 uses a static `PINTEREST_ACCESS_TOKEN` env var. If Pinterest tokens expire in your usage pattern, plumb in a refresh-token flow (Uploader has `PinterestOAuthClient` you can port).
+- **Image URL convention.** Defaults to `https://d2o1uvvg91z7o4.cloudfront.net/photos/{AlbumID}/{DesignID}/4.jpg` via `IMAGE_BASE_URL` + `PHOTO_PREFIX`. Same default the cross-stitch reader synthesizes for designs without an explicit `ImageUrl` attribute.
+- **Design page URL convention.** Built by the shared `PatternLinkHelper` per [`url-conventions.md §4.1`](../cross-stitch-platform-docs/docs/integration/url-conventions.md).
+- **Token refresh.** The shared `PinterestOAuthClient` handles refresh transparently via the JSON token store shared with Uploader (path comes from `cross-stitch-platform-docs/platform-config.json` → `pinterestTokenPath`).

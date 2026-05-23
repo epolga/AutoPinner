@@ -1,17 +1,21 @@
 using Amazon;
 using Amazon.SimpleEmail;
-using Amazon.SimpleEmail.Model;
+using CrossStitch.Shared.Email;
 
 namespace AutoPinner.EmailNotifier;
 
 /// <summary>
-/// SES SendEmail implementation. The sender identity must be verified in SES;
-/// AutoPinner reuses whatever identity ALERT_EMAIL_FROM resolves to (typically
-/// the cross-stitch.com Uploader-verified sender, ann@cross-stitch.com).
+/// SES SendEmail wrapper that delegates to the shared <see cref="EmailHelper"/>
+/// so both Uploader and AutoPinner go through the same code path when sending
+/// operator email. AutoPinner reads sender/recipient/configuration-set from
+/// its env (matching Uploader's <c>SenderEmail</c>/<c>AdminEmail</c>/
+/// <c>SesConfigurationSetName</c> App.config keys), and the actual SES API
+/// call is the shared helper's <c>SendEmailAsync</c> method.
 /// </summary>
 public sealed class SesEmailNotifier : IEmailNotifier, IDisposable
 {
     private readonly AmazonSimpleEmailServiceClient _ses;
+    private readonly EmailHelper _emailHelper = new();
     private readonly string _from;
     private readonly string _to;
     private readonly string? _configurationSet;
@@ -30,21 +34,15 @@ public sealed class SesEmailNotifier : IEmailNotifier, IDisposable
 
     public async Task SendAsync(string subject, string textBody, string? htmlBody = null, CancellationToken ct = default)
     {
-        var body = new Body { Text = new Content(textBody) };
-        if (!string.IsNullOrWhiteSpace(htmlBody)) body.Html = new Content(htmlBody);
-
-        var request = new SendEmailRequest
-        {
-            Source = _from,
-            Destination = new Destination { ToAddresses = new List<string> { _to } },
-            ConfigurationSetName = _configurationSet,
-            Message = new Message
-            {
-                Subject = new Content(subject),
-                Body = body,
-            },
-        };
-
-        await _ses.SendEmailAsync(request, ct).ConfigureAwait(false);
+        await _emailHelper.SendEmailAsync(
+            _ses,
+            _from,
+            new[] { _to },
+            subject,
+            textBody,
+            htmlBody,
+            headers: null,
+            configurationSetName: _configurationSet,
+            cancellationToken: ct).ConfigureAwait(false);
     }
 }

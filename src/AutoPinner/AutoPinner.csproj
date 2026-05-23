@@ -18,9 +18,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="AlbumBoards.csv">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
+    <ProjectReference Include="..\..\..\CrossStitch.Shared\src\CrossStitch.Shared\CrossStitch.Shared.csproj" />
   </ItemGroup>
 
 </Project>
