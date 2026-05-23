@@ -20,6 +20,9 @@ Thumbs.db
 # Logs
 *.log
 
+# One-off CSV exports written by --export-descriptions-csv
+pin-descriptions.csv
+
 # a5c / babysitter
 .a5c/
 .a5c_backup/
