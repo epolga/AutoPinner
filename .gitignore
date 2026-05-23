@@ -19,3 +19,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# a5c / babysitter
+.a5c/
+.a5c_backup/
