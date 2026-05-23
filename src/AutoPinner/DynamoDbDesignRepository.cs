@@ -204,10 +204,13 @@ public sealed class DynamoDbDesignRepository : IDisposable
 
     private static bool HasAnyPinId(Dictionary<string, AttributeValue> item)
     {
+        // Most rows store pin id as S (the current writer convention), but
+        // older rows have it as N — both count as "already pinned".
         foreach (var name in PinIdAttributeNames)
         {
-            if (item.TryGetValue(name, out var v) && !string.IsNullOrWhiteSpace(v.S))
-                return true;
+            if (!item.TryGetValue(name, out var v)) continue;
+            if (!string.IsNullOrWhiteSpace(v.S)) return true;
+            if (!string.IsNullOrWhiteSpace(v.N)) return true;
         }
         return false;
     }
@@ -261,8 +264,9 @@ public sealed class DynamoDbDesignRepository : IDisposable
     {
         foreach (var name in PinIdAttributeNames)
         {
-            if (item.TryGetValue(name, out var v) && !string.IsNullOrWhiteSpace(v.S))
-                return v.S;
+            if (!item.TryGetValue(name, out var v)) continue;
+            if (!string.IsNullOrWhiteSpace(v.S)) return v.S;
+            if (!string.IsNullOrWhiteSpace(v.N)) return v.N;
         }
         return null;
     }
