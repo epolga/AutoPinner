@@ -1,0 +1,16 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AutoPinner", "src\AutoPinner\AutoPinner.csproj", "{B1D9F7C2-7E51-4B3D-9C2D-1B7E8A2D3F01}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B1D9F7C2-7E51-4B3D-9C2D-1B7E8A2D3F01}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B1D9F7C2-7E51-4B3D-9C2D-1B7E8A2D3F01}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B1D9F7C2-7E51-4B3D-9C2D-1B7E8A2D3F01}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B1D9F7C2-7E51-4B3D-9C2D-1B7E8A2D3F01}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
