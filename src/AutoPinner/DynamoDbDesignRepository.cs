@@ -53,17 +53,24 @@ public sealed class DynamoDbDesignRepository : IDisposable
     /// `take` rows whose pin id is missing under all six historical spellings,
     /// AND whose PinterestStatus is not already POSTING/POSTED. Stops early at
     /// safetyPageLimit pages to avoid runaway scans.
+    ///
+    /// Skips any row whose DesignID already has a pin on another row — a design
+    /// that shares a DesignID with an already-pinned row must not be pinned again,
+    /// even if that specific row has no pin yet.
     /// </summary>
     public async Task<IReadOnlyList<Design>> GetLatestUnpinnedAsync(
         int take,
         int safetyPageLimit = 50,
         CancellationToken ct = default)
     {
-        var collected = new List<Design>(take);
+        // Track DesignIDs that already have a pin on at least one row so we
+        // never pin a second row for the same logical design.
+        var pinnedDesignIds = new HashSet<int>();
+        var candidates = new List<Design>();
         Dictionary<string, AttributeValue>? exclusiveStartKey = null;
         var page = 0;
 
-        while (collected.Count < take && page < safetyPageLimit)
+        while (page < safetyPageLimit)
         {
             page++;
             var req = new QueryRequest
@@ -88,20 +95,30 @@ public sealed class DynamoDbDesignRepository : IDisposable
 
             foreach (var item in resp.Items)
             {
-                if (HasAnyPinId(item)) continue;
+                if (HasAnyPinId(item))
+                {
+                    if (TryReadInt(item, "DesignID", out var did))
+                        pinnedDesignIds.Add(did);
+                    continue;
+                }
                 if (IsBusyOrPosted(item)) continue;
 
                 var design = ProjectDesign(item);
                 if (design is null) continue;
-                collected.Add(design);
-                if (collected.Count >= take) break;
+                candidates.Add(design);
             }
 
             exclusiveStartKey = (resp.LastEvaluatedKey is { Count: > 0 }) ? resp.LastEvaluatedKey : null;
-            if (exclusiveStartKey is null) break;
+
+            // Stop once we have enough eligible candidates or the table is exhausted.
+            var eligible = candidates.Count(c => !pinnedDesignIds.Contains(c.DesignId));
+            if (eligible >= take || exclusiveStartKey is null) break;
         }
 
-        return collected;
+        return candidates
+            .Where(c => !pinnedDesignIds.Contains(c.DesignId))
+            .Take(take)
+            .ToList();
     }
 
     /// <summary>
