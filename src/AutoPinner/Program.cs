@@ -54,7 +54,12 @@ var linkHelper = new PatternLinkHelper(new PatternLinkConfig
 });
 
 var uploader = new PinterestUploader(
-    new PinterestUploaderConfig { DefaultBoardId = config.DefaultBoardId },
+    new PinterestUploaderConfig
+    {
+        DefaultBoardId = config.DefaultBoardId,
+        AlbumLinkRatio = config.AlbumLinkRatio,
+        AbStatsFilePath = config.AlbumLinkRatio > 0.0 ? PlatformConfig.ResolvePinAbStatsPath() : null,
+    },
     linkHelper,
     oauthClient);
 
@@ -66,6 +71,8 @@ var retryPolicy = new RetryPolicy();
 
 var stats = new RunStats();
 var consecutiveFailures = 0;
+// Cache album captions within a run to avoid a DDB query per pin for the same album.
+var albumCaptionCache = new Dictionary<int, string>();
 var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
@@ -161,6 +168,12 @@ async Task ProcessOneAsync(Design design, CancellationToken ct)
         return;
     }
 
+    if (!albumCaptionCache.TryGetValue(design.AlbumId, out var albumCaption))
+    {
+        albumCaption = await repo.GetAlbumCaptionAsync(design.AlbumId, ct).ConfigureAwait(false);
+        albumCaptionCache[design.AlbumId] = albumCaption;
+    }
+
     var pinInput = new PinPatternInfo
     {
         AlbumId = design.AlbumId,
@@ -172,17 +185,21 @@ async Task ProcessOneAsync(Design design, CancellationToken ct)
         Width = design.Width,
         Height = design.Height,
         NColors = design.NColors,
+        AlbumCaption = albumCaption,
     };
 
     string pinId;
+    var linkType = CrossStitch.Shared.Pinterest.PinLinkType.Design;
     try
     {
         // Retry transient Pinterest failures (429 + 5xx) with exponential
         // backoff; non-transient 4xx falls through immediately.
-        pinId = await retryPolicy.ExecuteAsync(
+        var pinResult = await retryPolicy.ExecuteAsync(
             _ => uploader.UploadPinForPatternAsync(pinInput),
             ex => ex is PinterestApiException papi && papi.IsTransient,
             ct);
+        pinId = pinResult.PinId;
+        linkType = pinResult.LinkType;
     }
     catch (PinterestApiException papi)
     {
@@ -205,7 +222,7 @@ async Task ProcessOneAsync(Design design, CancellationToken ct)
 
     try
     {
-        await repo.MarkPostedAsync(design, pinId, ct);
+        await repo.MarkPostedAsync(design, pinId, linkType, ct);
     }
     catch (Exception ex)
     {

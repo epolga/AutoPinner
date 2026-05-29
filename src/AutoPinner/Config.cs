@@ -44,6 +44,13 @@ public sealed class Config
     public bool AlertDailySummaryEnabled { get; }
     public int AlertDailySummaryHourUtc { get; }
 
+    /// <summary>
+    /// Fraction of pins that should link to the album page (0.0 = off, 0.20 = 20 %).
+    /// Mirrors Uploader's PinterestAlbumLinkRatio. Both processes share the same
+    /// pin-ab-stats.json counter so the ratio holds globally.
+    /// </summary>
+    public double AlbumLinkRatio { get; }
+
     public bool EmailEnabled => !string.IsNullOrWhiteSpace(SenderEmail) && !string.IsNullOrWhiteSpace(AdminEmail);
 
     public Config()
@@ -76,6 +83,8 @@ public sealed class Config
         AlertDailySummaryEnabled = EnvBool("ALERT_DAILY_SUMMARY_ENABLED", false);
         AlertDailySummaryHourUtc = EnvInt("ALERT_DAILY_SUMMARY_HOUR_UTC", 7);
 
+        AlbumLinkRatio = Math.Clamp(EnvDouble("ALBUM_LINK_RATIO", 0.0), 0.0, 1.0);
+
         if (PostIntervalSeconds < 60)
             throw new InvalidOperationException($"POST_INTERVAL_SECONDS must be ≥ 60 (got {PostIntervalSeconds}); short intervals will trip Pinterest spam signals.");
         if (DailyCap < 1)
@@ -104,6 +113,15 @@ public sealed class Config
         if (string.IsNullOrWhiteSpace(raw)) return fallback;
         if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v))
             throw new InvalidOperationException($"Env var {name}={raw} is not an integer.");
+        return v;
+    }
+
+    private static double EnvDouble(string name, double fallback)
+    {
+        var raw = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(raw)) return fallback;
+        if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var v))
+            throw new InvalidOperationException($"Env var {name}={raw} is not a valid number.");
         return v;
     }
 

@@ -2,6 +2,7 @@ using Amazon;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.Model;
 using AutoPinner.Models;
+using CrossStitch.Shared.Pinterest;
 
 namespace AutoPinner;
 
@@ -215,25 +216,60 @@ public sealed class DynamoDbDesignRepository : IDisposable
     }
 
     /// <summary>
-    /// Stamp POSTED + the returned pin id. Also clears any prior error string.
+    /// Stamp POSTED + the returned pin id and link type. Also clears any prior error string.
     /// </summary>
-    public async Task MarkPostedAsync(Design design, string pinId, CancellationToken ct = default)
+    public async Task MarkPostedAsync(Design design, string pinId, PinLinkType linkType = PinLinkType.Design, CancellationToken ct = default)
     {
         var req = new UpdateItemRequest
         {
             TableName = _tableName,
             Key = PrimaryKey(design),
             UpdateExpression =
-                $"SET {CanonicalPinIdAttribute} = :pinid, PinterestStatus = :posted, PinterestLastAttemptAt = :now " +
+                $"SET {CanonicalPinIdAttribute} = :pinid, PinterestStatus = :posted, PinterestLastAttemptAt = :now, PinLinkType = :linktype " +
                 "REMOVE PinterestLastError",
             ExpressionAttributeValues = new Dictionary<string, AttributeValue>
             {
                 [":pinid"] = new AttributeValue { S = pinId },
                 [":posted"] = new AttributeValue { S = Status_Posted },
                 [":now"] = new AttributeValue { S = DateTime.UtcNow.ToString("o") },
+                [":linktype"] = new AttributeValue { S = linkType.ToString().ToUpperInvariant() },
             },
         };
         await _client.UpdateItemAsync(req, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Fetch the display name (Caption) of an album record. Returns empty string
+    /// if the record is not found or DDB call fails — album URL degrades gracefully.
+    /// Results should be cached by the caller; this issues a DDB query each call.
+    /// </summary>
+    public async Task<string> GetAlbumCaptionAsync(int albumId, CancellationToken ct = default)
+    {
+        try
+        {
+            var req = new QueryRequest
+            {
+                TableName = _tableName,
+                KeyConditionExpression = "ID = :pk",
+                FilterExpression = "EntityType = :albumType",
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                {
+                    [":pk"] = new AttributeValue { S = $"ALB#{albumId:D4}" },
+                    [":albumType"] = new AttributeValue { S = "ALBUM" },
+                },
+                ProjectionExpression = "Caption",
+                Limit = 1,
+            };
+            var resp = await _client.QueryAsync(req, ct).ConfigureAwait(false);
+            if (resp.Items.Count > 0 &&
+                resp.Items[0].TryGetValue("Caption", out var captionAttr) &&
+                !string.IsNullOrWhiteSpace(captionAttr.S))
+            {
+                return captionAttr.S;
+            }
+        }
+        catch { /* non-fatal */ }
+        return string.Empty;
     }
 
     /// <summary>
